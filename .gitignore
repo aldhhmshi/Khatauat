@@ -10,3 +10,5 @@ storage/secure/*
 storage/logs/*
 storage/snapshots/*
 storage/*.lock
+
+!.env.example
