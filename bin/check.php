@@ -11,8 +11,8 @@ $checks = [
     'openssl' => extension_loaded('openssl'),
     'curl (AI optional)' => extension_loaded('curl'),
     'storage/database writable' => is_writable(dirname((string)config('db_path'))),
-    'storage/logs writable' => is_writable(dirname(__DIR__) . '/storage/logs'),
-    'storage/snapshots writable' => is_writable(dirname(__DIR__) . '/storage/snapshots'),
+    'storage/logs writable' => is_writable(storage_path('logs')),
+    'storage/snapshots writable' => is_writable(storage_path('snapshots')),
 ];
 $failed = 0;
 foreach ($checks as $name => $ok) {

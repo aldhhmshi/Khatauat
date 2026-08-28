@@ -19,13 +19,33 @@ final class Database
             throw new RuntimeException('امتداد pdo_sqlite غير مفعّل على الخادم. فعّل PHP SQLite ثم أعد المحاولة.');
         }
         $path = (string) \config('db_path');
+        $isProduction = strtolower((string) \config('env', 'production')) === 'production';
         $dir = dirname($path);
+
+        // Production must never create a new/empty SQLite file when the
+        // configured persistent database is missing. This protects against
+        // a bad deployment or an unreadable shared mount silently resetting
+        // the application to a blank database.
+        if ($isProduction) {
+            $size = is_file($path) ? filesize($path) : false;
+            if ($size === false || !is_readable($path) || $size < 8192) {
+                throw new RuntimeException('قاعدة بيانات الإنتاج غير متاحة أو تبدو فارغة؛ تم إيقاف التشغيل الآمن ولم يتم إنشاء SQLite جديدة. تحقق من DB_PATH والمسار المشترك.');
+            }
+        }
+
         if (!is_dir($dir)) mkdir($dir, 0770, true);
         self::$pdo = new PDO('sqlite:' . $path, null, null, [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES => false,
         ]);
+        if ($isProduction) {
+            $tables = (int) self::$pdo->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")->fetchColumn();
+            if ($tables < 1) {
+                self::$pdo = null;
+                throw new RuntimeException('قاعدة بيانات الإنتاج لا تحتوي جداول؛ تم إيقاف التشغيل الآمن لمنع استخدام SQLite فارغة.');
+            }
+        }
         self::$pdo->exec('PRAGMA foreign_keys = ON;');
         self::$pdo->exec('PRAGMA busy_timeout = 8000;');
         self::$pdo->exec('PRAGMA journal_mode = WAL;');

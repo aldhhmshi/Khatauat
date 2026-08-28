@@ -12,7 +12,11 @@ spl_autoload_register(function (string $class): void {
     if (is_file($file)) require_once $file;
 });
 
-load_env(dirname(__DIR__) . '/.env');
+$projectRoot = dirname(__DIR__, 2);
+$sharedEnv = getenv('KHATAUAT_SHARED_ENV') ?: dirname($projectRoot) . '/shared/.env';
+// Shared state wins over a release-local .env; the fallback keeps local development compatible.
+load_env($sharedEnv);
+load_env($projectRoot . '/.env');
 $GLOBALS['config'] = require dirname(__DIR__) . '/config/app.php';
 date_default_timezone_set(config('timezone', 'Asia/Riyadh'));
 

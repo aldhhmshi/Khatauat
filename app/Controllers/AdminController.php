@@ -607,10 +607,10 @@ if($tableExists('live_service_incidents')){
         $tmp=(string)$file['tmp_name']; $mime=(new \finfo(FILEINFO_MIME_TYPE))->file($tmp) ?: '';
         $ext=['image/png'=>'png','image/jpeg'=>'jpg','image/webp'=>'webp'][$mime]??null; if($ext===null){\flash('error','صيغة الصورة غير مدعومة. استخدم PNG أو JPG أو WebP.');return null;}
         $name=$prefix.'-'.date('YmdHis').'-'.bin2hex(random_bytes(3)).'.'.$ext; $relative='assets/uploads/'.$name;
-        $projectTarget=\root_path('public/'.$relative); @mkdir(dirname($projectTarget),0755,true);
-        $domainRoot=dirname(\root_path()); $deployedTarget=$domainRoot.'/public_html/'.$relative; @mkdir(dirname($deployedTarget),0755,true);
+        $projectTarget=\uploads_path($name); @mkdir(dirname($projectTarget),0750,true);
+        $deployedTarget=\public_uploads_path($name); @mkdir(dirname($deployedTarget),0755,true);
         if(!move_uploaded_file($tmp,$projectTarget)){\flash('error','تعذر حفظ الصورة على الخادم.');return null;}
-        if(is_dir(dirname($deployedTarget))) @copy($projectTarget,$deployedTarget);
+        if($deployedTarget!==$projectTarget && is_dir(dirname($deployedTarget))) @copy($projectTarget,$deployedTarget);
         return $relative;
     }
 
@@ -627,10 +627,10 @@ if($tableExists('live_service_incidents')){
         if($type===null){\flash('error','صيغة البانر غير مدعومة. استخدم PNG/JPG/WebP أو MP4/WebM.');return null;}
         if((int)$file['size']>$limit){\flash('error',$type==='video'?'حجم الفيديو يتجاوز 25MB.':'حجم الصورة يتجاوز 4MB.');return null;}
         $name=$prefix.'-'.date('YmdHis').'-'.bin2hex(random_bytes(3)).'.'.$ext; $relative='assets/uploads/'.$name;
-        $projectTarget=\root_path('public/'.$relative); @mkdir(dirname($projectTarget),0755,true);
-        $domainRoot=dirname(\root_path()); $deployedTarget=$domainRoot.'/public_html/'.$relative; @mkdir(dirname($deployedTarget),0755,true);
+        $projectTarget=\uploads_path($name); @mkdir(dirname($projectTarget),0750,true);
+        $deployedTarget=\public_uploads_path($name); @mkdir(dirname($deployedTarget),0755,true);
         if(!move_uploaded_file($tmp,$projectTarget)){\flash('error','تعذر حفظ ملف البانر على الخادم.');return null;}
-        if(is_dir(dirname($deployedTarget))) @copy($projectTarget,$deployedTarget);
+        if($deployedTarget!==$projectTarget && is_dir(dirname($deployedTarget))) @copy($projectTarget,$deployedTarget);
         return ['path'=>$relative,'type'=>$type];
     }
 
