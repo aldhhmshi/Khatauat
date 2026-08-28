@@ -9,7 +9,9 @@ try {
     $stats=(new SourceMonitor())->run();
     echo sprintf("checked=%d changed=%d failed=%d\n",$stats['checked'],$stats['changed'],$stats['failed']);
 } catch (Throwable $e) {
-    file_put_contents(dirname(__DIR__).'/storage/logs/monitor.log','['.date('c').'] '.$e->getMessage().PHP_EOL,FILE_APPEND);
+    $logDir = storage_path('logs');
+    if (!is_dir($logDir)) @mkdir($logDir, 0770, true);
+    file_put_contents($logDir . '/monitor.log','['.date('c').'] '.$e->getMessage().PHP_EOL,FILE_APPEND);
     fwrite(STDERR,$e->getMessage().PHP_EOL);
     exit(1);
 }

@@ -3,6 +3,11 @@ DirectoryIndex index.php
 
 <IfModule mod_rewrite.c>
 RewriteEngine On
+
+# Application internals and persistent state must never be served directly.
+RewriteRule ^(?:app|bin|config|database|resources|scripts|storage|vendor)(?:/|$) - [F,L,NC]
+RewriteRule ^(?:composer\.(?:json|lock)|package\.json|pnpm-lock\.yaml|\.env(?:\..*)?)$ - [F,L,NC]
+
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ index.php [QSA,L]

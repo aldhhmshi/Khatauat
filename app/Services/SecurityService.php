@@ -18,7 +18,7 @@ final class SecurityService
         $env = trim((string)(getenv('APP_SECURITY_KEY') ?: ''));
         if ($env !== '') return self::$key = $env;
 
-        $dir = \root_path('storage/secure');
+        $dir = \secure_path();
         $path = $dir . '/app_security.key';
         if (is_file($path)) {
             $value = trim((string)file_get_contents($path));
@@ -27,7 +27,7 @@ final class SecurityService
         if (!is_dir($dir)) @mkdir($dir, 0770, true);
         $value = bin2hex(random_bytes(32));
         if (@file_put_contents($path, $value . PHP_EOL, LOCK_EX) === false) {
-            throw new RuntimeException('تعذر إنشاء مفتاح الأمان داخل storage/secure.');
+            throw new RuntimeException('تعذر إنشاء مفتاح الأمان داخل مسار التخزين الآمن.');
         }
         @chmod($path, 0600);
         return self::$key = $value;

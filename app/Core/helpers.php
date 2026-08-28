@@ -24,6 +24,30 @@ function root_path(string $path = ''): string
     return dirname(__DIR__, 2) . ($path ? '/' . ltrim($path, '/') : '');
 }
 
+function storage_path(string $path = ''): string
+{
+    $root = rtrim((string) config('storage_root', root_path('storage')), '/\\');
+    return $root . ($path ? '/' . ltrim($path, '/\\') : '');
+}
+
+function secure_path(string $path = ''): string
+{
+    $root = rtrim((string) config('secure_root', storage_path('secure')), '/\\');
+    return $root . ($path ? '/' . ltrim($path, '/\\') : '');
+}
+
+function uploads_path(string $path = ''): string
+{
+    $root = rtrim((string) config('uploads_root', root_path('public/assets/uploads')), '/\\');
+    return $root . ($path ? '/' . ltrim($path, '/\\') : '');
+}
+
+function public_uploads_path(string $path = ''): string
+{
+    $root = rtrim((string) config('public_uploads_root', root_path('public/assets/uploads')), '/\\');
+    return $root . ($path ? '/' . ltrim($path, '/\\') : '');
+}
+
 function e(?string $value): string
 {
     return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');

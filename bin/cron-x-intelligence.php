@@ -32,7 +32,9 @@ try{
     echo json_encode($result,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT).PHP_EOL;
     if(!($result['ok']??false)) exit(1);
 }catch(Throwable $e){
-    $log=dirname(__DIR__).'/storage/logs/x-intelligence.log';
+    $logDir = storage_path('logs');
+    if (!is_dir($logDir)) @mkdir($logDir, 0770, true);
+    $log=$logDir.'/x-intelligence.log';
     @file_put_contents($log,'['.date('c').'] '.$e->getMessage().PHP_EOL,FILE_APPEND);
     fwrite(STDERR,$e->getMessage().PHP_EOL);
     exit(1);

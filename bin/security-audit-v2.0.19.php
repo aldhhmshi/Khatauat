@@ -3,7 +3,7 @@ declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
 use Khatauat\Core\Database;
 use Khatauat\Services\MoyasarGateway;
-$root=realpath(root_path()) ?: root_path();$public=realpath(dirname(dirname(__DIR__)).'/public_html') ?: '';$db=realpath((string)config('db_path')) ?: (string)config('db_path');$key=realpath(root_path('storage/secure/app_security.key')) ?: root_path('storage/secure/app_security.key');$gateway=new MoyasarGateway();
+$root=realpath(root_path()) ?: root_path();$public=realpath(dirname(dirname(__DIR__)).'/public_html') ?: '';$db=realpath((string)config('db_path')) ?: (string)config('db_path');$key=realpath(secure_path('app_security.key')) ?: secure_path('app_security.key');$gateway=new MoyasarGateway();
 $r=[
  'db_outside_public_html'=>$public===''||!str_starts_with($db,$public),
  'security_key_exists'=>is_file($key),

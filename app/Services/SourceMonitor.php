@@ -230,7 +230,7 @@ final class SourceMonitor
 
     private function saveSnapshot(int $sourceId, string $hash, string $clean): void
     {
-        $snapshotDir = \root_path('storage/snapshots');
+        $snapshotDir = \storage_path('snapshots');
         if (!is_dir($snapshotDir)) mkdir($snapshotDir, 0775, true);
         $file = $snapshotDir . '/source-' . $sourceId . '-' . date('YmdHis') . '.txt';
         file_put_contents($file, $clean, LOCK_EX);
