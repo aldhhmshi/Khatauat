@@ -12,7 +12,7 @@ spl_autoload_register(function (string $class): void {
     if (is_file($file)) require_once $file;
 });
 
-$projectRoot = dirname(__DIR__, 2);
+$projectRoot = dirname(__DIR__);
 $sharedEnv = getenv('KHATAUAT_SHARED_ENV') ?: dirname($projectRoot) . '/shared/.env';
 // Shared state wins over a release-local .env; the fallback keeps local development compatible.
 load_env($sharedEnv);
