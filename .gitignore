@@ -1,0 +1,12 @@
+.env
+.env.*
+storage/*.sqlite
+storage/*.db
+.env
+.env.*
+storage/database/*.sqlite
+storage/database/*.db
+storage/secure/*
+storage/logs/*
+storage/snapshots/*
+storage/*.lock

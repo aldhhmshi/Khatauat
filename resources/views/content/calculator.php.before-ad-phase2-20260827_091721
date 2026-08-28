@@ -1,0 +1,17 @@
+<?php
+use Khatauat\Services\CalculatorService;
+$sourceUrl=trim((string)($calculator['source_url']??''));
+$sourceLabel=trim((string)($calculator['source_label']??'المصدر الرسمي')) ?: 'المصدر الرسمي';
+?>
+<section class="v217-calc-detail-hero"><div class="container"><a class="v217-back" href="<?= e(url('calculators')) ?>">جميع الحاسبات ←</a><span class="eyebrow"><?= e(CalculatorService::categoryLabel((string)($calculator['category']??'general'))) ?></span><h1><?= e($calculator['name']) ?></h1><p><?= e($calculator['purpose']) ?></p></div></section>
+<section class="v217-calc-detail"><div class="container v217-calc-layout">
+  <main class="v217-calc-workbench" data-calculator-engine="<?= e($calculator['engine_key']) ?>">
+    <header><div class="v217-calc-icon large"><?= e((string)($calculator['icon']??'▦')) ?></div><div><small>نسخة القاعدة <?= e((string)($calculator['rule_version']??'1.0')) ?></small><h2><?= e($calculator['name']) ?></h2></div></header>
+    <div class="v217-engine-form" data-engine-form></div>
+    <div class="v217-result" data-engine-result hidden><span>النتيجة التقديرية</span><strong data-result-primary>—</strong><div data-result-lines></div></div>
+    <div class="v217-calc-note"><span>✓</span><p><?= e((string)($calculator['disclaimer']??'النتيجة تقديرية وإرشادية. راجع المصدر الرسمي قبل اتخاذ قرار ملزم.')) ?></p></div>
+    <?php if($sourceUrl!==''): ?><div class="v217-source-ref"><div><small>مرجع القاعدة</small><strong><?= e($sourceLabel) ?></strong><?php if(!empty($calculator['verified_at'])): ?><span>آخر تحقق: <?= e($calculator['verified_at']) ?></span><?php endif; ?></div><a href="<?= e($sourceUrl) ?>" target="_blank" rel="noopener nofollow">فتح المرجع الرسمي ↗</a></div><?php endif; ?>
+  </main>
+  <aside class="v217-calc-side"><h3>الحاسبات المتاحة</h3><?php foreach($calculators as $c): ?><a class="<?= $c['slug']===$calculator['slug']?'is-current':'' ?>" href="<?= e(url('calculator/'.$c['slug'])) ?>"><span><?= e((string)($c['icon']??'▦')) ?></span><div><strong><?= e($c['name']) ?></strong><small><?= e(CalculatorService::categoryLabel((string)($c['category']??'general'))) ?></small></div></a><?php endforeach; ?></aside>
+</div></section>
+<script src="<?= e(asset('js/calculators.js')) ?>?v=217" defer></script>

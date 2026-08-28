@@ -1,0 +1,1 @@
+<section class="error-page"><div class="container narrow"><span>500</span><h1>تعذر تشغيل المنصة</h1><p><?= e($errorMessage ?? 'حدث خطأ غير متوقع.') ?></p><p>إذا كانت الرسالة تشير إلى SQLite، فعّل امتداد <code>pdo_sqlite</code> في PHP ثم أعد المحاولة.</p></div></section>

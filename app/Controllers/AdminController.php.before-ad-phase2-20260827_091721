@@ -1,0 +1,685 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Khatauat\Controllers;
+
+use Khatauat\Core\Auth;
+use Khatauat\Core\Csrf;
+use Khatauat\Core\Database;
+use Khatauat\Core\Settings;
+use Khatauat\Core\View;
+use Khatauat\Services\AiDraftService;
+use Khatauat\Services\ArticleDraftMapper;
+use Khatauat\Services\PublishGuard;
+
+final class AdminController
+{
+    private function guard(): void { Auth::requireOwner(); }
+
+    private function queueServiceNotifications(int $serviceId, string $serviceName): void
+    {
+        $followers = Database::fetchAll('SELECT f.user_id FROM follows f JOIN users u ON u.id=f.user_id WHERE f.follow_type="service" AND f.follow_id=? AND u.notifications_enabled=1', [$serviceId]);
+        foreach ($followers as $f) {
+            Database::execute('INSERT INTO notifications(user_id,title,message,link,channel,status,created_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)', [(int)$f['user_id'],'تحديث منشور: '.$serviceName,'تم نشر أو اعتماد تحديث متعلق بخدمة تتابعها.','/service/'.(Database::fetch('SELECT slug FROM services WHERE id=?',[$serviceId])['slug']??''),'in_app','sent']);
+        }
+    }
+
+    public function dashboard(): void
+    {
+        $this->guard();
+        $tableExists = static function(string $name): bool {
+            return (bool)Database::fetch("SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", [$name]);
+        };
+        $stats=[
+            'published'=>(int)(Database::fetch("SELECT COUNT(*) c FROM services WHERE status='published'")['c']??0),
+            'drafts'=>(int)(Database::fetch("SELECT COUNT(*) c FROM services WHERE status='draft'")['c']??0),
+            'reports'=>(int)(Database::fetch("SELECT COUNT(*) c FROM trust_reports WHERE status IN ('new','reviewing')")['c']??0),
+            'checks'=>(int)(Database::fetch("SELECT COUNT(*) c FROM source_checks WHERE date(checked_at)=date('now')")['c']??0),
+            'users'=>(int)(Database::fetch("SELECT COUNT(*) c FROM users WHERE role='user'")['c']??0),
+            'source_registry'=>$tableExists('source_registry')?(int)(Database::fetch("SELECT COUNT(*) c FROM source_registry WHERE status='active'")['c']??0):0,
+            'verified_x'=>$tableExists('official_x_accounts')?(int)(Database::fetch("SELECT COUNT(DISTINCT target_id) c FROM official_x_accounts WHERE active=1 AND verification_status='verified'")['c']??0):0,
+            'incidents'=>$tableExists('live_service_incidents')?(int)(Database::fetch("SELECT COUNT(*) c FROM live_service_incidents WHERE status IN ('confirmed','suspected') AND datetime(expires_at)>datetime('now')")['c']??0):0,
+            'ai_drafts'=>(int)(Database::fetch("SELECT COUNT(*) c FROM ai_drafts WHERE status IN ('draft','review')")['c']??0),
+        ];
+        $recentReports=Database::fetchAll('SELECT tr.*, s.name service_name FROM trust_reports tr JOIN services s ON s.id=tr.service_id ORDER BY tr.created_at DESC LIMIT 6');
+        $recentChecks=Database::fetchAll('SELECT sc.*, src.title source_title FROM source_checks sc JOIN sources src ON src.id=sc.source_id ORDER BY sc.checked_at DESC LIMIT 8');
+        
+$recentIncidents=[];
+if($tableExists('live_service_incidents')){
+    // v2.0.15: live_service_incidents never had a guaranteed detected_at column.
+    // Read the newest available timestamp without breaking older/newer schemas.
+    $incidentColumns=array_map(static fn(array $r):string=>(string)($r['name']??''), Database::fetchAll('PRAGMA table_info(live_service_incidents)'));
+    $timeColumn=in_array('last_seen_at',$incidentColumns,true)?'last_seen_at':(in_array('first_seen_at',$incidentColumns,true)?'first_seen_at':(in_array('created_at',$incidentColumns,true)?'created_at':null));
+    if($timeColumn!==null){
+        $recentIncidents=Database::fetchAll("SELECT title,status,confidence,".$timeColumn." AS detected_at,expires_at FROM live_service_incidents WHERE status IN ('confirmed','suspected') AND datetime(expires_at)>datetime('now') ORDER BY ".$timeColumn." DESC LIMIT 5");
+    }
+}
+        View::render('admin/dashboard',['title'=>'لوحة المالك','stats'=>$stats,'recentReports'=>$recentReports,'recentChecks'=>$recentChecks,'recentIncidents'=>$recentIncidents]);
+    }
+
+    public function services(): void
+    {
+        $this->guard();
+        $services=Database::fetchAll('SELECT s.*, c.name category_name,(SELECT COUNT(*) FROM service_steps ss WHERE ss.service_id=s.id) step_count FROM services s LEFT JOIN categories c ON c.id=s.category_id ORDER BY s.updated_at DESC,s.id DESC');
+        $categories=Database::fetchAll('SELECT c.*,(SELECT COUNT(*) FROM services s WHERE s.category_id=c.id) service_count FROM categories c ORDER BY c.name');
+        View::render('admin/services',['title'=>'إدارة دليل الإجراءات','services'=>$services,'categories'=>$categories]);
+    }
+
+    public function categorySave(): void
+    {
+        $this->guard(); Csrf::verify();
+        $name = trim((string)($_POST['name'] ?? ''));
+        $slug = trim((string)($_POST['slug'] ?? '')) ?: \slugify($name);
+        if ($name === '' || $slug === '') { \flash('error','اسم التصنيف مطلوب.'); \redirect('admin/services'); }
+        try {
+            Database::execute('INSERT INTO categories(name,slug,description,created_at) VALUES(?,?,?,CURRENT_TIMESTAMP)', [$name,$slug,trim((string)($_POST['description']??''))]);
+            \flash('success','تمت إضافة التصنيف.');
+        } catch (\Throwable $e) { \flash('error','تعذر إضافة التصنيف؛ تحقق من عدم تكرار الرابط المختصر.'); }
+        \redirect('admin/services');
+    }
+
+    public function categoryDelete(): void
+    {
+        $this->guard(); Csrf::verify(); $id=(int)($_POST['id']??0);
+        $count=(int)(Database::fetch('SELECT COUNT(*) c FROM services WHERE category_id=?',[$id])['c']??0);
+        if($count>0) \flash('error','لا يمكن حذف تصنيف مرتبط بخدمات.'); else { Database::execute('DELETE FROM categories WHERE id=?',[$id]); \flash('success','تم حذف التصنيف.'); }
+        \redirect('admin/services');
+    }
+
+    public function serviceNew(): void { $this->guard(); $this->renderService(null); }
+    public function serviceEdit(string $id): void { $this->guard(); $this->renderService((int)$id); }
+
+    private function renderService(?int $id): void
+    {
+        $service=$id?Database::fetch('SELECT * FROM services WHERE id=?',[$id]):null;
+        if($id && !$service){http_response_code(404);View::render('errors/404',['title'=>'غير موجود']);return;}
+        $categories=Database::fetchAll('SELECT * FROM categories ORDER BY name');
+        $sources=Database::fetchAll('SELECT * FROM sources ORDER BY title');
+        $steps=$id?Database::fetchAll('SELECT ss.*,src.title source_title FROM service_steps ss LEFT JOIN sources src ON src.id=ss.source_id WHERE ss.service_id=? ORDER BY ss.position',[$id]):[];
+        $questions=$id?Database::fetchAll('SELECT pq.*,(SELECT group_concat(label, "، ") FROM path_question_options pqo WHERE pqo.question_id=pq.id ORDER BY pqo.position) options_text FROM path_questions pq WHERE pq.service_id=? ORDER BY pq.position',[$id]):[];
+        $rules=$id?Database::fetchAll('SELECT pr.*,ss.title step_title FROM path_rules pr JOIN service_steps ss ON ss.id=pr.step_id WHERE pr.service_id=? ORDER BY pr.id',[$id]):[];
+        View::render('admin/service_edit',['title'=>$service?'تعديل '.$service['name']:'إضافة خدمة','service'=>$service,'categories'=>$categories,'sources'=>$sources,'steps'=>$steps,'questions'=>$questions,'rules'=>$rules]);
+    }
+
+    public function serviceSave(): void
+    {
+        $this->guard(); Csrf::verify();
+        $id=(int)($_POST['id']??0); $name=trim((string)($_POST['name']??'')); $slug=trim((string)($_POST['slug']??'')); if($slug==='')$slug=\slugify($name);
+        if($name===''||$slug===''){\flash('error','اسم الخدمة والرابط المختصر مطلوبان.');\redirect($id?'admin/service/'.$id:'admin/service/new');}
+        $data=[
+            (int)($_POST['category_id']??0)?:null,$name,$slug,trim((string)($_POST['official_entity']??'')),trim((string)($_POST['summary']??'')),trim((string)($_POST['beneficiaries']??'')),trim((string)($_POST['eligibility']??'')),trim((string)($_POST['requirements']??'')),trim((string)($_POST['notes']??'')),trim((string)($_POST['official_url']??'')),trim((string)($_POST['official_platform']??'')),(string)($_POST['status']??'draft'),isset($_POST['indexable'])?1:0,trim((string)($_POST['seo_title']??'')),trim((string)($_POST['seo_description']??''))
+        ];
+        $requestedStatus = $data[11];
+        $data[11] = 'draft';
+        if($id){
+            Database::execute('UPDATE services SET category_id=?,name=?,slug=?,official_entity=?,summary=?,beneficiaries=?,eligibility=?,requirements=?,notes=?,official_url=?,official_platform=?,status=?,indexable=?,seo_title=?,seo_description=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',array_merge($data,[$id]));
+        } else {
+            Database::execute('INSERT INTO services(category_id,name,slug,official_entity,summary,beneficiaries,eligibility,requirements,notes,official_url,official_platform,status,indexable,seo_title,seo_description,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',$data);
+            $id=Database::lastInsertId();
+        }
+        if($requestedStatus === 'published') {
+            $errors = (new PublishGuard())->validateService($id);
+            if($errors) {
+                \flash('error', 'حارس النشر منع النشر: ' . implode(' | ', array_slice($errors,0,4)));
+            } else {
+                Database::execute('UPDATE services SET status="published",published_at=COALESCE(published_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?',[$id]);
+                $this->queueServiceNotifications($id,$name);
+                \flash('success','تم حفظ الخدمة ونشرها بعد اجتياز حارس النشر.');
+                \redirect('admin/service/'.$id);
+            }
+        }
+        \flash('success','تم حفظ الخدمة كمسودة.'); \redirect('admin/service/'.$id);
+    }
+
+    public function stepSave(): void
+    {
+        $this->guard(); Csrf::verify();
+        $serviceId=(int)($_POST['service_id']??0); $id=(int)($_POST['id']??0);
+        $vals=[
+            $serviceId,(int)($_POST['position']??1),trim((string)($_POST['title']??'')),trim((string)($_POST['entity']??'')),trim((string)($_POST['platform']??'')),trim((string)($_POST['prerequisite']??'')),trim((string)($_POST['action_text']??'')),trim((string)($_POST['output_text']??'')),trim((string)($_POST['official_url']??'')),(int)($_POST['source_id']??0)?:null,(int)($_POST['depends_on_step_id']??0)?:null,isset($_POST['is_blocking'])?1:0,(string)($_POST['trust_status']??'needs_review'),trim((string)($_POST['verified_at']??''))?:null,trim((string)($_POST['verified_by']??''))
+        ];
+        if($id) Database::execute('UPDATE service_steps SET service_id=?,position=?,title=?,entity=?,platform=?,prerequisite=?,action_text=?,output_text=?,official_url=?,source_id=?,depends_on_step_id=?,is_blocking=?,trust_status=?,verified_at=?,verified_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',array_merge($vals,[$id]));
+        else Database::execute('INSERT INTO service_steps(service_id,position,title,entity,platform,prerequisite,action_text,output_text,official_url,source_id,depends_on_step_id,is_blocking,trust_status,verified_at,verified_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',$vals);
+        Database::execute('UPDATE services SET status="draft",updated_at=CURRENT_TIMESTAMP WHERE id=?',[$serviceId]);
+        \flash('success','تم حفظ الخطوة وأعيدت الخدمة إلى مسودة للمراجعة.'); \redirect('admin/service/'.$serviceId);
+    }
+
+    public function stepDelete(): void
+    {
+        $this->guard(); Csrf::verify(); $id=(int)($_POST['id']??0);$sid=(int)($_POST['service_id']??0);
+        Database::execute('DELETE FROM service_steps WHERE id=? AND service_id=?',[$id,$sid]); Database::execute('UPDATE services SET status="draft",updated_at=CURRENT_TIMESTAMP WHERE id=?',[$sid]); \flash('success','تم حذف الخطوة وأعيدت الخدمة إلى مسودة.');\redirect('admin/service/'.$sid);
+    }
+
+    public function questionSave(): void
+    {
+        $this->guard(); Csrf::verify(); $serviceId=(int)($_POST['service_id']??0);$id=(int)($_POST['id']??0);$key=trim((string)($_POST['question_key']??''));$text=trim((string)($_POST['question_text']??''));$pos=(int)($_POST['position']??1);$required=isset($_POST['is_required'])?1:0;
+        if($id) Database::execute('UPDATE path_questions SET question_key=?,question_text=?,position=?,is_required=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND service_id=?',[$key,$text,$pos,$required,$id,$serviceId]);
+        else { Database::execute('INSERT INTO path_questions(service_id,question_key,question_text,position,is_required,created_at,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',[$serviceId,$key,$text,$pos,$required]);$id=Database::lastInsertId(); }
+        Database::execute('DELETE FROM path_question_options WHERE question_id=?',[$id]);
+        $labels=preg_split('/\r\n|\r|\n/',trim((string)($_POST['options']??'')))?:[];$p=1;
+        foreach($labels as $line){$line=trim($line);if($line==='')continue;[$optKey,$label]=array_pad(array_map('trim',explode('|',$line,2)),2,'');if($label===''){$label=$optKey;$optKey=\slugify($label);}Database::execute('INSERT INTO path_question_options(question_id,option_key,label,position) VALUES(?,?,?,?)',[$id,$optKey,$label,$p++]);}
+        Database::execute('UPDATE services SET status="draft",updated_at=CURRENT_TIMESTAMP WHERE id=?',[$serviceId]);
+        \flash('success','تم حفظ سؤال المسار وأعيدت الخدمة إلى مسودة.');\redirect('admin/service/'.$serviceId);
+    }
+
+    public function ruleSave(): void
+    {
+        $this->guard();Csrf::verify();$sid=(int)($_POST['service_id']??0);$step=(int)($_POST['step_id']??0);$key=trim((string)($_POST['question_key']??''));$op=(string)($_POST['operator']??'eq');$value=trim((string)($_POST['value']??''));
+        Database::execute('INSERT INTO path_rules(service_id,step_id,question_key,operator,value,created_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)',[$sid,$step,$key,$op,$value]);Database::execute('UPDATE services SET status="draft",updated_at=CURRENT_TIMESTAMP WHERE id=?',[$sid]);\flash('success','تمت إضافة قاعدة الظهور وأعيدت الخدمة إلى مسودة.');\redirect('admin/service/'.$sid);
+    }
+
+    public function ruleDelete(): void
+    {
+        $this->guard();Csrf::verify();$sid=(int)($_POST['service_id']??0);$id=(int)($_POST['id']??0);Database::execute('DELETE FROM path_rules WHERE id=? AND service_id=?',[$id,$sid]);Database::execute('UPDATE services SET status="draft",updated_at=CURRENT_TIMESTAMP WHERE id=?',[$sid]);\redirect('admin/service/'.$sid);
+    }
+
+    public function sources(): void
+    {
+        $this->guard();$sources=Database::fetchAll('SELECT *,(SELECT status FROM source_checks sc WHERE sc.source_id=sources.id ORDER BY checked_at DESC LIMIT 1) last_check_status FROM sources ORDER BY id DESC');View::render('admin/sources',['title'=>'مركز المراقبة والمصادر','sources'=>$sources]);
+    }
+
+    public function sourceSave(): void
+    {
+        $this->guard();Csrf::verify();$id=(int)($_POST['id']??0);$vals=[trim((string)($_POST['title']??'')),trim((string)($_POST['entity']??'')),trim((string)($_POST['url']??'')),isset($_POST['monitor_enabled'])?1:0,trim((string)($_POST['verified_at']??''))?:null,trim((string)($_POST['verified_by']??''))];
+        if($id)Database::execute('UPDATE sources SET title=?,entity=?,url=?,monitor_enabled=?,verified_at=?,verified_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',array_merge($vals,[$id]));else Database::execute('INSERT INTO sources(title,entity,url,monitor_enabled,verified_at,verified_by,created_at,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',$vals);
+        \flash('success','تم حفظ المصدر.');\redirect('admin/sources');
+    }
+
+    public function trustReports(): void
+    {
+        $this->guard();$reports=Database::fetchAll('SELECT tr.*,s.name service_name,ss.title step_title,u.email user_email FROM trust_reports tr JOIN services s ON s.id=tr.service_id LEFT JOIN service_steps ss ON ss.id=tr.step_id LEFT JOIN users u ON u.id=tr.user_id ORDER BY CASE tr.status WHEN "new" THEN 0 WHEN "reviewing" THEN 1 ELSE 2 END,tr.created_at DESC');View::render('admin/trust_reports',['title'=>'بلاغات مركز الثقة','reports'=>$reports]);
+    }
+
+    public function trustStatus(): void
+    {
+        $this->guard();Csrf::verify();$id=(int)($_POST['id']??0);$status=(string)($_POST['status']??'reviewing');if(!in_array($status,['new','reviewing','closed'],true))$status='reviewing';Database::execute('UPDATE trust_reports SET status=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?',[$status,Auth::id(),$id]);\redirect('admin/trust-reports');
+    }
+
+    public function content(): void
+    {
+        $this->guard();
+        $articles = Database::fetchAll('SELECT * FROM articles ORDER BY id DESC');
+        $calculators = Database::fetchAll('SELECT * FROM calculators ORDER BY id DESC');
+        $updates = Database::fetchAll('SELECT u.*,s.title source_title FROM updates u LEFT JOIN sources s ON s.id=u.source_id ORDER BY u.id DESC LIMIT 30');
+        $editId = (int) ($_GET['edit'] ?? 0);
+        $editArticle = $editId > 0 ? Database::fetch('SELECT * FROM articles WHERE id=?', [$editId]) : null;
+        View::render('admin/content', [
+            'title' => 'المحتوى والتحديثات',
+            'articles' => $articles,
+            'calculators' => $calculators,
+            'updates' => $updates,
+            'editArticle' => $editArticle,
+        ]);
+    }
+
+    public function articleSave(): void
+    {
+        $this->guard();
+        Csrf::verify();
+
+        $id = (int) ($_POST['id'] ?? 0);
+        $title = trim((string) ($_POST['title'] ?? ''));
+        $slug = trim((string) ($_POST['slug'] ?? '')) ?: \slugify($title);
+        $status = (string) ($_POST['status'] ?? 'draft');
+        if (!in_array($status, ['draft', 'published'], true)) $status = 'draft';
+
+        if ($title === '' || $slug === '') {
+            \flash('error', 'العنوان والرابط المختصر مطلوبان.');
+            \redirect('admin/content' . ($id ? '?edit=' . $id : ''));
+        }
+
+        $duplicate = Database::fetch('SELECT id FROM articles WHERE slug=? AND id<>? LIMIT 1', [$slug, $id]);
+        if ($duplicate) {
+            \flash('error', 'الرابط المختصر مستخدم في مقال آخر.');
+            \redirect('admin/content' . ($id ? '?edit=' . $id : ''));
+        }
+
+        $sourceUrls = ArticleDraftMapper::normalizeUrls((string) ($_POST['source_urls'] ?? ''));
+        $sourceUrlsText = implode("\n", $sourceUrls);
+        $verified = isset($_POST['sources_verified']);
+        $verificationNotes = trim((string) ($_POST['verification_notes'] ?? ''));
+
+        if ($status === 'published' && (!$verified || $sourceUrls === [])) {
+            \flash('error', 'لا يمكن نشر المقال قبل إرفاق مصدر رسمي واحد على الأقل وتأكيد مراجعة المصادر.');
+            \redirect('admin/content' . ($id ? '?edit=' . $id : ''));
+        }
+
+        $values = [
+            $title,
+            $slug,
+            trim((string) ($_POST['summary'] ?? '')),
+            ArticleDraftMapper::sanitizeHtml((string) ($_POST['content'] ?? '')),
+            trim((string) ($_POST['seo_title'] ?? '')),
+            trim((string) ($_POST['seo_description'] ?? '')),
+            $sourceUrlsText,
+            $verificationNotes,
+            $verified ? date('Y-m-d H:i:s') : null,
+            $verified ? (string) (Auth::user()['name'] ?? 'owner') : null,
+            $status,
+        ];
+
+        if ($id > 0) {
+            Database::execute('UPDATE articles SET title=?,slug=?,summary=?,content=?,seo_title=?,seo_description=?,source_urls=?,verification_notes=?,verified_at=?,verified_by=?,status=?,published_at=CASE WHEN ?="published" THEN COALESCE(published_at,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?', array_merge($values, [$status, $id]));
+            \flash('success', 'تم تحديث المقال.');
+            \redirect('admin/content?edit=' . $id);
+        }
+
+        Database::execute('INSERT INTO articles(title,slug,summary,content,seo_title,seo_description,source_urls,verification_notes,verified_at,verified_by,status,published_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,CASE WHEN ?="published" THEN CURRENT_TIMESTAMP ELSE NULL END,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)', array_merge($values, [$status]));
+        \flash('success', 'تم حفظ المقال.');
+        \redirect('admin/content');
+    }
+
+    public function calculatorSave(): void
+    {
+        $this->guard();Csrf::verify();$name=trim((string)($_POST['name']??''));Database::execute('INSERT INTO calculators(name,entity,platform,purpose,beneficiaries,instructions,official_url,source_url,verified_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',[$name,trim((string)($_POST['entity']??'')),trim((string)($_POST['platform']??'')),trim((string)($_POST['purpose']??'')),trim((string)($_POST['beneficiaries']??'')),trim((string)($_POST['instructions']??'')),trim((string)($_POST['official_url']??'')),trim((string)($_POST['source_url']??'')),trim((string)($_POST['verified_at']??''))?:null,(string)($_POST['status']??'draft')]);\flash('success','تم حفظ الحاسبة.');\redirect('admin/content');
+    }
+
+    public function updatePublish(): void
+    {
+        $this->guard();Csrf::verify();$id=(int)($_POST['id']??0);$status=(string)($_POST['status']??'published');Database::execute('UPDATE updates SET status=?,verified_at=CURRENT_TIMESTAMP,verified_by=?,published_at=CASE WHEN ?="published" THEN CURRENT_TIMESTAMP ELSE published_at END WHERE id=?',[$status,Auth::user()['name']??'owner',$status,$id]);\redirect('admin/content');
+    }
+
+    public function ads(): void
+    {
+        $this->guard();
+        $experiments=Database::fetchAll('SELECT * FROM ad_experiments ORDER BY id DESC');
+        $banner=[
+            'enabled'=>Settings::get('banner_enabled','0')==='1',
+            'text'=>(string)Settings::get('banner_text',''),
+            'link_text'=>(string)Settings::get('banner_link_text',''),
+            'link_url'=>(string)Settings::get('banner_link_url',''),
+            'bg'=>(string)Settings::get('banner_bg','#0d4b46'),
+            'text_color'=>(string)Settings::get('banner_text_color','#ffffff'),
+            'scope'=>(string)Settings::get('banner_scope','all'),
+            'image'=>(string)Settings::get('banner_media_path', Settings::get('banner_image_path','')),
+            'media_type'=>(string)Settings::get('banner_media_type','image'),
+            'description'=>(string)Settings::get('banner_description',''),
+            'sticky'=>Settings::get('banner_sticky','1')==='1',
+            'platform_url'=>(string)Settings::get('platform_url', (string)\config('base_url','')),
+        ];
+        View::render('admin/ads',['title'=>'الإعلانات والبانر','experiments'=>$experiments,'banner'=>$banner]);
+    }
+
+    public function adSave(): void
+    {
+        $this->guard();Csrf::verify();$placement=(string)($_POST['placement']??'home_mid');$allowed=['home_mid','procedures_mid','article_mid','calculators_mid','updates_mid'];if(!in_array($placement,$allowed,true)){\flash('error','هذا الموضع غير مسموح لأنه قد يقترب من عناصر التنفيذ.');\redirect('admin/ads');}
+        Database::execute('INSERT INTO ad_experiments(name,placement,variant_a,variant_b,traffic_split,status,starts_at,ends_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',[trim((string)($_POST['name']??'')),$placement,trim((string)($_POST['variant_a']??'')),trim((string)($_POST['variant_b']??'')),max(1,min(99,(int)($_POST['traffic_split']??50))),(string)($_POST['status']??'draft'),trim((string)($_POST['starts_at']??''))?:null,trim((string)($_POST['ends_at']??''))?:null]);\flash('success','تم إنشاء تجربة الإعلان.');\redirect('admin/ads');
+    }
+
+    public function adStatus(): void
+    {
+        $this->guard(); Csrf::verify();
+        $id=(int)($_POST['id']??0); $status=(string)($_POST['status']??'paused');
+        if(!in_array($status,['draft','running','paused','ended'],true)) $status='paused';
+        Database::execute('UPDATE ad_experiments SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',[$status,$id]);
+        \flash('success','تم تحديث حالة التجربة.'); \redirect('admin/ads');
+    }
+
+    public function bannerSave(): void
+    {
+        $this->guard(); Csrf::verify();
+        Settings::set('banner_enabled', isset($_POST['banner_enabled']) ? '1' : '0');
+        Settings::set('banner_text', trim((string)($_POST['banner_text'] ?? '')));
+        Settings::set('banner_link_text', trim((string)($_POST['banner_link_text'] ?? '')));
+        Settings::set('banner_link_url', trim((string)($_POST['banner_link_url'] ?? '')));
+        Settings::set('banner_bg', $this->hexColor((string)($_POST['banner_bg'] ?? ''), '#0d4b46'));
+        Settings::set('banner_text_color', $this->hexColor((string)($_POST['banner_text_color'] ?? ''), '#ffffff'));
+        Settings::set('banner_scope', in_array((string)($_POST['banner_scope'] ?? 'all'), ['all','home'], true) ? (string)$_POST['banner_scope'] : 'all');
+        Settings::set('banner_description', trim((string)($_POST['banner_description'] ?? '')));
+        Settings::set('banner_sticky', isset($_POST['banner_sticky']) ? '1' : '0');
+        if (isset($_POST['remove_banner_media'])) {
+            Settings::set('banner_media_path','');
+            Settings::set('banner_image_path','');
+            Settings::set('banner_media_type','image');
+        }
+        $uploaded = $this->uploadUiMedia('banner_media', 'banner');
+        if ($uploaded !== null) {
+            Settings::set('banner_media_path', $uploaded['path']);
+            Settings::set('banner_media_type', $uploaded['type']);
+            if ($uploaded['type'] === 'image') Settings::set('banner_image_path', $uploaded['path']);
+        }
+        \flash('success','تم حفظ البانر العلوي.'); \redirect('admin/ads');
+    }
+
+    public function bannerDelete(): void
+    {
+        $this->guard(); Csrf::verify();
+        foreach (['banner_enabled','banner_text','banner_link_text','banner_link_url','banner_image_path','banner_media_path','banner_description'] as $key) Settings::set($key, '');
+        Settings::set('banner_media_type','image');
+        Settings::set('banner_enabled','0');
+        \flash('success','تمت إزالة البانر من الموقع.'); \redirect('admin/ads');
+    }
+
+    public function appearance(): void
+    {
+        $this->guard();
+        if (\is_post()) {
+            Csrf::verify();
+            $textKeys=['site_name','site_tagline','platform_url','notice_text','home_hero_eyebrow','home_hero_title','home_hero_highlight','home_hero_description','home_search_placeholder','home_primary_label','home_primary_url','home_secondary_label','home_secondary_url','home_services_eyebrow','home_services_title','home_feature_eyebrow','home_feature_title','home_feature_description','home_feature_button_label','home_feature_button_url','footer_description'];
+            foreach($textKeys as $key) Settings::set($key, trim((string)($_POST[$key] ?? '')));
+            foreach(['home_hero_enabled','home_stats_enabled','home_services_enabled','home_feature_enabled','home_updates_enabled','home_articles_enabled','home_calculators_enabled','notice_enabled'] as $key) Settings::set($key, isset($_POST[$key]) ? '1' : '0');
+            Settings::set('brand_primary',$this->hexColor((string)($_POST['brand_primary']??''),'#0d4b46'));
+            Settings::set('brand_secondary',$this->hexColor((string)($_POST['brand_secondary']??''),'#16766e'));
+            Settings::set('brand_accent',$this->hexColor((string)($_POST['brand_accent']??''),'#d7f46b'));
+            Settings::set('site_background',$this->hexColor((string)($_POST['site_background']??''),'#fbfdfc'));
+            $font=(string)($_POST['font_family']??'ibm-plex');
+            Settings::set('font_family',in_array($font,['ibm-plex','tajawal','noto-kufi','system'],true)?$font:'ibm-plex');
+            $motion=(string)($_POST['motion_level']??'safe'); Settings::set('motion_level',in_array($motion,['safe','reduced','off'],true)?$motion:'safe');
+            if(isset($_POST['remove_logo'])) Settings::set('site_logo_path','');
+            $logo=$this->uploadUiImage('site_logo','logo'); if($logo!==null) Settings::set('site_logo_path',$logo);
+            \flash('success','تم تحديث هوية الموقع ومحتوى الصفحة الرئيسية.'); \redirect('admin/appearance');
+        }
+        View::render('admin/appearance',['title'=>'المظهر والمحتوى','settings'=>Settings::all()]);
+    }
+
+    public function homepageBlockSave(): void
+    {
+        $this->guard(); Csrf::verify();
+        $blocks=json_decode((string)Settings::get('home_custom_blocks','[]'),true); if(!is_array($blocks))$blocks=[];
+        $id=trim((string)($_POST['id']??'')); if($id==='') $id=bin2hex(random_bytes(5));
+        $style=in_array((string)($_POST['style']??'default'),['default','tint','brand'],true)?(string)$_POST['style']:'default';
+        $item=['id'=>$id,'eyebrow'=>trim((string)($_POST['eyebrow']??'')),'title'=>trim((string)($_POST['title']??'')),'body'=>trim((string)($_POST['body']??'')),'button_label'=>trim((string)($_POST['button_label']??'')),'button_url'=>trim((string)($_POST['button_url']??'')),'style'=>$style,'enabled'=>isset($_POST['enabled'])];
+        $found=false; foreach($blocks as $i=>$b){if(is_array($b)&&($b['id']??'')===$id){$blocks[$i]=$item;$found=true;break;}}
+        if(!$found && count($blocks)<20) $blocks[]=$item;
+        Settings::set('home_custom_blocks',(string)json_encode($blocks,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
+        \flash('success',$found?'تم تحديث المقطع.':'تمت إضافة المقطع.'); \redirect('admin/appearance');
+    }
+
+    public function homepageBlockDelete(): void
+    {
+        $this->guard(); Csrf::verify(); $id=trim((string)($_POST['id']??''));
+        $blocks=json_decode((string)Settings::get('home_custom_blocks','[]'),true); if(!is_array($blocks))$blocks=[];
+        $blocks=array_values(array_filter($blocks,fn($b)=>!is_array($b)||($b['id']??'')!==$id));
+        Settings::set('home_custom_blocks',(string)json_encode($blocks,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
+        \flash('success','تم حذف المقطع.'); \redirect('admin/appearance');
+    }
+
+    private function hexColor(string $value, string $fallback): string
+    {
+        $value=trim($value); return preg_match('/^#[0-9a-fA-F]{6}$/',$value) ? strtolower($value) : $fallback;
+    }
+
+    private function uploadUiImage(string $field, string $prefix): ?string
+    {
+        if(!isset($_FILES[$field]) || !is_array($_FILES[$field]) || (int)($_FILES[$field]['error']??UPLOAD_ERR_NO_FILE)===UPLOAD_ERR_NO_FILE) return null;
+        $file=$_FILES[$field]; if((int)$file['error']!==UPLOAD_ERR_OK){\flash('error','تعذر رفع الصورة.');return null;}
+        if((int)$file['size']>2*1024*1024){\flash('error','حجم الصورة يتجاوز 2MB.');return null;}
+        $tmp=(string)$file['tmp_name']; $mime=(new \finfo(FILEINFO_MIME_TYPE))->file($tmp) ?: '';
+        $ext=['image/png'=>'png','image/jpeg'=>'jpg','image/webp'=>'webp'][$mime]??null; if($ext===null){\flash('error','صيغة الصورة غير مدعومة. استخدم PNG أو JPG أو WebP.');return null;}
+        $name=$prefix.'-'.date('YmdHis').'-'.bin2hex(random_bytes(3)).'.'.$ext; $relative='assets/uploads/'.$name;
+        $projectTarget=\root_path('public/'.$relative); @mkdir(dirname($projectTarget),0755,true);
+        $domainRoot=dirname(\root_path()); $deployedTarget=$domainRoot.'/public_html/'.$relative; @mkdir(dirname($deployedTarget),0755,true);
+        if(!move_uploaded_file($tmp,$projectTarget)){\flash('error','تعذر حفظ الصورة على الخادم.');return null;}
+        if(is_dir(dirname($deployedTarget))) @copy($projectTarget,$deployedTarget);
+        return $relative;
+    }
+
+    private function uploadUiMedia(string $field, string $prefix): ?array
+    {
+        if(!isset($_FILES[$field]) || !is_array($_FILES[$field]) || (int)($_FILES[$field]['error']??UPLOAD_ERR_NO_FILE)===UPLOAD_ERR_NO_FILE) return null;
+        $file=$_FILES[$field]; if((int)$file['error']!==UPLOAD_ERR_OK){\flash('error','تعذر رفع ملف البانر.');return null;}
+        $tmp=(string)$file['tmp_name']; $mime=(new \finfo(FILEINFO_MIME_TYPE))->file($tmp) ?: '';
+        $imageMap=['image/png'=>'png','image/jpeg'=>'jpg','image/webp'=>'webp'];
+        $videoMap=['video/mp4'=>'mp4','video/webm'=>'webm'];
+        $type=null; $ext=null; $limit=0;
+        if(isset($imageMap[$mime])){$type='image';$ext=$imageMap[$mime];$limit=4*1024*1024;}
+        elseif(isset($videoMap[$mime])){$type='video';$ext=$videoMap[$mime];$limit=25*1024*1024;}
+        if($type===null){\flash('error','صيغة البانر غير مدعومة. استخدم PNG/JPG/WebP أو MP4/WebM.');return null;}
+        if((int)$file['size']>$limit){\flash('error',$type==='video'?'حجم الفيديو يتجاوز 25MB.':'حجم الصورة يتجاوز 4MB.');return null;}
+        $name=$prefix.'-'.date('YmdHis').'-'.bin2hex(random_bytes(3)).'.'.$ext; $relative='assets/uploads/'.$name;
+        $projectTarget=\root_path('public/'.$relative); @mkdir(dirname($projectTarget),0755,true);
+        $domainRoot=dirname(\root_path()); $deployedTarget=$domainRoot.'/public_html/'.$relative; @mkdir(dirname($deployedTarget),0755,true);
+        if(!move_uploaded_file($tmp,$projectTarget)){\flash('error','تعذر حفظ ملف البانر على الخادم.');return null;}
+        if(is_dir(dirname($deployedTarget))) @copy($projectTarget,$deployedTarget);
+        return ['path'=>$relative,'type'=>$type];
+    }
+
+    public function analytics(): void
+    {
+        $this->guard();
+        $period=(string)($_GET['period']??'30'); if(!in_array($period,['7','30','90'],true))$period='30';
+        $days=(int)$period; $modifier='-'.$days.' days';
+        $stats=['pageviews'=>0,'sessions'=>0,'ad_impressions'=>0,'ad_clicks'=>0,'ctr'=>0.0];
+        try {
+            $stats['pageviews']=(int)(Database::fetch("SELECT COUNT(*) c FROM traffic_events WHERE event_type='pageview' AND created_at>=datetime('now',?)",[$modifier])['c']??0);
+            $stats['sessions']=(int)(Database::fetch("SELECT COUNT(DISTINCT session_hash) c FROM traffic_events WHERE event_type='pageview' AND created_at>=datetime('now',?)",[$modifier])['c']??0);
+            $sources=Database::fetchAll("SELECT source_category label,COUNT(*) total FROM traffic_events WHERE event_type='pageview' AND created_at>=datetime('now',?) GROUP BY source_category ORDER BY total DESC LIMIT 8",[$modifier]);
+            $devices=Database::fetchAll("SELECT device_type label,COUNT(*) total FROM traffic_events WHERE event_type='pageview' AND created_at>=datetime('now',?) GROUP BY device_type ORDER BY total DESC",[$modifier]);
+            $pages=Database::fetchAll("SELECT page_path label,COUNT(*) total FROM traffic_events WHERE event_type='pageview' AND created_at>=datetime('now',?) GROUP BY page_path ORDER BY total DESC LIMIT 10",[$modifier]);
+            $daily=Database::fetchAll("SELECT date(created_at) day,COUNT(*) total FROM traffic_events WHERE event_type='pageview' AND created_at>=datetime('now',?) GROUP BY date(created_at) ORDER BY day",[$modifier]);
+        } catch (\Throwable) { $sources=$devices=$pages=$daily=[]; }
+        try {
+            $ad=Database::fetch("SELECT SUM(event_type='impression') imp,SUM(event_type='click') clk FROM ad_experiment_events WHERE created_at>=datetime('now',?)",[$modifier])?:[];
+            $stats['ad_impressions']=(int)($ad['imp']??0); $stats['ad_clicks']=(int)($ad['clk']??0);
+            $stats['ctr']=$stats['ad_impressions']>0?round(($stats['ad_clicks']/$stats['ad_impressions'])*100,2):0.0;
+            $experiments=Database::fetchAll("SELECT x.id,x.name,x.placement,x.status,COALESCE(SUM(e.event_type='impression'),0) impressions,COALESCE(SUM(e.event_type='click'),0) clicks FROM ad_experiments x LEFT JOIN ad_experiment_events e ON e.experiment_id=x.id AND e.created_at>=datetime('now',?) GROUP BY x.id ORDER BY impressions DESC,x.id DESC LIMIT 12",[$modifier]);
+        } catch (\Throwable) { $experiments=[]; }
+        View::render('admin/analytics',['title'=>'تحليلات الإعلانات والزيارات','period'=>$period,'stats'=>$stats,'sources'=>$sources,'devices'=>$devices,'pages'=>$pages,'daily'=>$daily,'experiments'=>$experiments]);
+    }
+
+    public function settings(): void
+    {
+        $this->guard();
+        if(\is_post()){Csrf::verify();$keys=['site_tagline','platform_url','legal_entity_name','commercial_registration_number','legal_contact_email','ga4_measurement_id','adsense_code','monetag_code','ai_api_url','ai_model','smtp_host','smtp_port','smtp_user','smtp_from'];foreach($keys as $k)Settings::set($k,trim((string)($_POST[$k]??'')));Settings::set('adsense_enabled',isset($_POST['adsense_enabled'])?'1':'0');Settings::set('monetag_enabled',isset($_POST['monetag_enabled'])?'1':'0');Settings::set('internal_analytics_enabled',isset($_POST['internal_analytics_enabled'])?'1':'0');\flash('success','تم حفظ الإعدادات دون تغيير إعدادات غير موجودة في النموذج.');\redirect('admin/settings');}
+        View::render('admin/settings',['title'=>'إعدادات المنصة','settings'=>Settings::all()]);
+    }
+
+    public function aiDrafts(): void
+    {
+        $this->guard();
+        $drafts = Database::fetchAll('SELECT d.*,a.id article_id,a.slug article_slug,a.status article_status,a.verified_at article_verified_at,a.source_urls article_source_urls FROM ai_drafts d LEFT JOIN articles a ON a.ai_draft_id=d.id ORDER BY d.id DESC LIMIT 50');
+        View::render('admin/ai_drafts', ['title' => 'مسودات الذكاء الاصطناعي', 'drafts' => $drafts]);
+    }
+
+    public function aiGenerate(): void
+    {
+        $this->guard();
+        Csrf::verify();
+        $topic = trim((string) ($_POST['topic'] ?? ''));
+        $aud = trim((string) ($_POST['audience'] ?? ''));
+        $kw = trim((string) ($_POST['keyword'] ?? ''));
+        $sources = trim((string) ($_POST['sources'] ?? ''));
+        $result = (new AiDraftService())->generate($topic, $aud, $kw, $sources);
+        $structured = isset($result['data']) && is_array($result['data'])
+            ? json_encode($result['data'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
+            : null;
+        Database::execute(
+            'INSERT INTO ai_drafts(topic,audience,keyword,sources_text,result_text,structured_json,provider,error_detail,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)',
+            [
+                $topic,
+                $aud,
+                $kw,
+                $sources,
+                $result['text'] ?? '',
+                $structured,
+                $result['provider'] ?? null,
+                $result['ok'] ? null : ($result['error'] ?? 'خطأ غير معروف'),
+                $result['ok'] ? 'draft' : 'failed',
+            ]
+        );
+        \flash($result['ok'] ? 'success' : 'error', $result['ok'] ? 'تم إنشاء حزمة مقال + SEO كمراجعة أولية. راجع المصادر قبل التحويل أو النشر.' : ('تعذر التوليد: ' . $result['error']));
+        \redirect('admin/ai-drafts');
+    }
+
+    public function aiDraftToArticle(): void
+    {
+        $this->guard();
+        Csrf::verify();
+        $id = (int) ($_POST['id'] ?? 0);
+        $draft = Database::fetch('SELECT * FROM ai_drafts WHERE id=?', [$id]);
+        if (!$draft || !in_array((string) $draft['status'], ['draft', 'converted'], true)) {
+            \flash('error', 'المسودة غير متاحة للتحويل.');
+            \redirect('admin/ai-drafts');
+        }
+
+        $data = ArticleDraftMapper::decodeDraft($draft);
+        if (!$data) {
+            \flash('error', 'تعذر قراءة المسودة المنظمة. أعد توليدها بالإصدار الجديد.');
+            \redirect('admin/ai-drafts');
+        }
+
+        $slug = $data['slug'] ?: \slugify((string) $data['title']);
+        $baseSlug = $slug;
+        $suffix = 2;
+        while (Database::fetch('SELECT id FROM articles WHERE slug=? LIMIT 1', [$slug])) {
+            $slug = $baseSlug . '-' . $suffix++;
+        }
+
+        $notes = [];
+        foreach ($data['verification_notes'] as $note) $notes[] = 'مراجعة: ' . $note;
+        foreach ($data['missing_information'] as $note) $notes[] = 'معلومة ناقصة: ' . $note;
+
+        Database::execute(
+            'INSERT INTO articles(title,slug,summary,content,seo_title,seo_description,source_urls,verification_notes,verified_at,verified_by,ai_draft_id,status,published_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,NULL,NULL,?,"draft",NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+            [
+                (string) $data['title'],
+                $slug,
+                (string) $data['summary'],
+                (string) $data['content_html'],
+                (string) $data['seo_title'],
+                (string) $data['seo_description'],
+                implode("\n", $data['source_urls']),
+                implode("\n", $notes),
+                $id,
+            ]
+        );
+        $articleId = Database::lastInsertId();
+        Database::execute('UPDATE ai_drafts SET status="converted" WHERE id=?', [$id]);
+        \flash('success', 'تم تحويل المسودة إلى مقال غير منشور. راجع المحتوى والمصادر ثم اعتمدها يدويًا.');
+        \redirect('admin/content?edit=' . $articleId);
+    }
+
+    public function aiDraftPublish(): void
+    {
+        $this->guard();
+        Csrf::verify();
+        $id = (int) ($_POST['id'] ?? 0);
+        $verified = isset($_POST['sources_verified']);
+        if (!$verified) {
+            \flash('error', 'يجب تأكيد مراجعة المصادر الرسمية قبل النشر.');
+            \redirect('admin/ai-drafts');
+        }
+
+        $draft = Database::fetch('SELECT * FROM ai_drafts WHERE id=?', [$id]);
+        if (!$draft || (string) ($draft['status'] ?? '') === 'failed') {
+            \flash('error', 'المسودة غير متاحة للنشر.');
+            \redirect('admin/ai-drafts');
+        }
+
+        $linked = Database::fetch('SELECT * FROM articles WHERE ai_draft_id=? ORDER BY id DESC LIMIT 1', [$id]);
+        if ($linked) {
+            $sourceUrls = ArticleDraftMapper::normalizeUrls((string) ($linked['source_urls'] ?? ''));
+            if ($sourceUrls === []) {
+                \flash('error', 'المقال المرتبط لا يحتوي على مصدر رسمي. افتحه وأضف المصادر قبل النشر.');
+                \redirect('admin/content?edit=' . (int) $linked['id']);
+            }
+            Database::execute('UPDATE articles SET verified_at=CURRENT_TIMESTAMP,verified_by=?,status="published",published_at=COALESCE(published_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?', [(string) (Auth::user()['name'] ?? 'owner'), (int) $linked['id']]);
+            Database::execute('UPDATE ai_drafts SET status="published" WHERE id=?', [$id]);
+            \flash('success', 'تم نشر المقال المرتبط بالمسودة بعد اعتماد المصادر.');
+            \redirect('admin/ai-drafts');
+        }
+
+        $data = ArticleDraftMapper::decodeDraft($draft);
+        if (!$data) {
+            \flash('error', 'تعذر قراءة المسودة المنظمة. حوّلها للمراجعة أو أعد توليدها.');
+            \redirect('admin/ai-drafts');
+        }
+        if ($data['source_urls'] === []) {
+            \flash('error', 'لا يمكن نشر المسودة دون مصدر رسمي واحد على الأقل.');
+            \redirect('admin/ai-drafts');
+        }
+        if ($data['missing_information'] !== []) {
+            \flash('error', 'المسودة تحتوي معلومات ناقصة. حوّلها إلى مقال للمراجعة وأكمل البيانات قبل النشر.');
+            \redirect('admin/ai-drafts');
+        }
+
+        $slug = $data['slug'] ?: \slugify((string) $data['title']);
+        $baseSlug = $slug;
+        $suffix = 2;
+        while (Database::fetch('SELECT id FROM articles WHERE slug=? LIMIT 1', [$slug])) {
+            $slug = $baseSlug . '-' . $suffix++;
+        }
+
+        $notes = [];
+        foreach ($data['verification_notes'] as $note) $notes[] = 'مراجعة: ' . $note;
+        Database::execute(
+            'INSERT INTO articles(title,slug,summary,content,seo_title,seo_description,source_urls,verification_notes,verified_at,verified_by,ai_draft_id,status,published_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?,?,"published",CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+            [
+                (string) $data['title'],
+                $slug,
+                (string) $data['summary'],
+                (string) $data['content_html'],
+                (string) $data['seo_title'],
+                (string) $data['seo_description'],
+                implode("\n", $data['source_urls']),
+                implode("\n", $notes),
+                (string) (Auth::user()['name'] ?? 'owner'),
+                $id,
+            ]
+        );
+        Database::execute('UPDATE ai_drafts SET status="published" WHERE id=?', [$id]);
+        \flash('success', 'تم نشر المسودة كمقال بعد اعتماد المصادر.');
+        \redirect('admin/ai-drafts');
+    }
+
+    public function aiDraftDelete(): void
+    {
+        $this->guard();
+        Csrf::verify();
+        $id = (int) ($_POST['id'] ?? 0);
+        $linked = Database::fetch('SELECT id FROM articles WHERE ai_draft_id=? ORDER BY id DESC LIMIT 1', [$id]);
+        if ($linked) {
+            Database::execute('UPDATE articles SET ai_draft_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE ai_draft_id=?', [$id]);
+        }
+        Database::execute('DELETE FROM ai_drafts WHERE id=?', [$id]);
+        \flash('success', $linked ? 'تم حذف المسودة فقط. المقال المرتبط بقي محفوظًا.' : 'تم حذف المسودة.');
+        \redirect('admin/ai-drafts');
+    }
+
+    public function articleStatus(): void
+    {
+        $this->guard();
+        Csrf::verify();
+        $id = (int) ($_POST['id'] ?? 0);
+        $status = (string) ($_POST['status'] ?? 'draft');
+        if (!in_array($status, ['draft', 'published'], true)) $status = 'draft';
+        $article = Database::fetch('SELECT * FROM articles WHERE id=?', [$id]);
+        if (!$article) {
+            \flash('error', 'المقال غير موجود.');
+            \redirect('admin/content');
+        }
+        if ($status === 'published') {
+            $urls = ArticleDraftMapper::normalizeUrls((string) ($article['source_urls'] ?? ''));
+            if ($urls === [] || empty($article['verified_at'])) {
+                \flash('error', 'راجع المقال وأكد المصادر الرسمية أولًا قبل النشر السريع.');
+                \redirect('admin/content?edit=' . $id);
+            }
+            Database::execute('UPDATE articles SET status="published",published_at=COALESCE(published_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?', [$id]);
+        } else {
+            Database::execute('UPDATE articles SET status="draft",published_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?', [$id]);
+        }
+        $draftId = (int) ($article['ai_draft_id'] ?? 0);
+        if ($draftId > 0) Database::execute('UPDATE ai_drafts SET status=? WHERE id=?', [$status === 'published' ? 'published' : 'converted', $draftId]);
+        \flash('success', $status === 'published' ? 'تم نشر المقال.' : 'تم إلغاء نشر المقال وإعادته إلى مسودة.');
+        \redirect('admin/content');
+    }
+
+    public function articleDelete(): void
+    {
+        $this->guard();
+        Csrf::verify();
+        $id = (int) ($_POST['id'] ?? 0);
+        $article = Database::fetch('SELECT ai_draft_id FROM articles WHERE id=?', [$id]);
+        if (!$article) {
+            \flash('error', 'المقال غير موجود.');
+            \redirect('admin/content');
+        }
+        Database::execute('DELETE FROM articles WHERE id=?', [$id]);
+        $draftId = (int) ($article['ai_draft_id'] ?? 0);
+        if ($draftId > 0) Database::execute('UPDATE ai_drafts SET status="draft" WHERE id=?', [$draftId]);
+        \flash('success', 'تم حذف المقال. وإذا كان مصدره مسودة AI فقد أعيدت المسودة إلى حالة قابلة للمراجعة.');
+        \redirect('admin/content');
+    }
+
+}

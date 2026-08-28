@@ -1,0 +1,1 @@
+<section class="error-page"><div class="container narrow"><span>404</span><h1>الصفحة غير موجودة</h1><p>قد يكون الرابط تغير أو أن المحتوى ما زال مسودة غير منشورة.</p><a class="btn btn-primary" href="<?= e(url('')) ?>">العودة للرئيسية</a></div></section>

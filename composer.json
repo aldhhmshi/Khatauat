@@ -1,0 +1,15 @@
+{
+  "name": "khatauat/platform",
+  "description": "Khatauat 2.0 Saudi Journey & Growth OS - PHP/SQLite procedural platform",
+  "type": "project",
+  "require": {
+    "php": ">=8.2",
+    "ext-pdo": "*",
+    "ext-pdo_sqlite": "*",
+    "ext-mbstring": "*",
+    "ext-curl": "*"
+  },
+  "suggest": {
+    "dompdf/dompdf": "Optional direct PDF download; browser print-to-PDF works without it."
+  }
+}

@@ -1,0 +1,1 @@
+<section class="error-page"><div class="container narrow"><span>403</span><h1>غير مصرح</h1><p>هذه الصفحة متاحة لمالك المنصة فقط.</p><a class="btn btn-primary" href="<?= e(url('')) ?>">العودة للرئيسية</a></div></section>
