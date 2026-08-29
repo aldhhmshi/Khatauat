@@ -14,7 +14,11 @@ use Khatauat\Controllers\AccountController;
 use Khatauat\Controllers\ContentController;
 use Khatauat\Controllers\AdminController;
 use Khatauat\Controllers\OwnerOpsController;
+use Khatauat\Controllers\AdminBillingController;
+use Khatauat\Controllers\BillingController;
 use Khatauat\Controllers\AiController;
+use Khatauat\Controllers\OrganizationController;
+use Khatauat\Controllers\WorkspaceController;
 
 $router = new Router();
 
@@ -44,8 +48,20 @@ $router->get('/export/{slug}/pdf', [PathController::class, 'pdf']);
 $router->get('/blog', [ContentController::class, 'blog']);
 $router->get('/article/{slug}', [ContentController::class, 'article']);
 $router->get('/calculators', [ContentController::class, 'calculators']);
+$router->get('/calculator/{slug}', [ContentController::class, 'calculator']);
 $router->get('/updates', [ContentController::class, 'updates']);
 
+$router->get('/plans', [BillingController::class, 'plans']);
+$router->get('/billing', [BillingController::class, 'account']);
+$router->get('/billing/checkout/{code}', [BillingController::class, 'checkout']);
+$router->post('/billing/checkout', [BillingController::class, 'startCheckout']);
+$router->get('/billing/success', [BillingController::class, 'success']);
+$router->get('/billing/back', [BillingController::class, 'back']);
+$router->post('/billing/case/start', [BillingController::class, 'startCase']);
+$router->get('/billing/paylink/callback', [BillingController::class, 'paylinkCallback']);
+$router->get('/billing/paylink/cancel', [BillingController::class, 'paylinkCancel']);
+$router->post('/webhooks/paylink', [BillingController::class, 'paylinkWebhook']);
+$router->post('/webhooks/moyasar', [BillingController::class, 'webhook']);
 $router->get('/login', [AuthController::class, 'login']);
 $router->post('/login', [AuthController::class, 'login']);
 $router->get('/register', [AuthController::class, 'register']);
@@ -55,9 +71,22 @@ $router->get('/account', [AccountController::class, 'index']);
 $router->post('/account/settings', [AccountController::class, 'settings']);
 $router->post('/account/follow', [AccountController::class, 'follow']);
 
+// Private module entry. It is intentionally not part of the public Steps nav.
+$router->get('/workspace', [WorkspaceController::class, 'index']);
+
+// Phase 1B tenant boundary. Existing public Steps routes remain unchanged.
+$router->get('/api/organizations', [OrganizationController::class, 'index']);
+$router->post('/api/organizations', [OrganizationController::class, 'create']);
+$router->post('/api/organizations/switch', [OrganizationController::class, 'switchContext']);
+$router->get('/api/organizations/{organizationId}/members', [OrganizationController::class, 'members']);
+$router->post('/api/organizations/member/invite', [OrganizationController::class, 'inviteMember']);
+$router->post('/api/organizations/member/status', [OrganizationController::class, 'changeMemberStatus']);
+
 $router->get('/ask-ai', [AiController::class, 'index']);
 $router->post('/ask-ai', [AiController::class, 'ask']);
 
+$router->get('/admin/billing', [AdminBillingController::class, 'index']);
+$router->post('/admin/billing/product', [AdminBillingController::class, 'saveProduct']);
 $router->get('/admin', [AdminController::class, 'dashboard']);
 $router->get('/admin/services', [AdminController::class, 'services']);
 $router->post('/admin/category/save', [AdminController::class, 'categorySave']);

@@ -20,6 +20,7 @@ $seoPrivatePrefixes = [
     '/login',
     '/register',
     '/ask-ai',
+    '/workspace',
 ];
 
 $seoNoindex = false;
